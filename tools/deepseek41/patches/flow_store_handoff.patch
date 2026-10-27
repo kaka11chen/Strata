@@ -1,0 +1,107 @@
+diff --git a/src/dsv41/ds4_store.hpp b/src/dsv41/ds4_store.hpp
+--- a/src/dsv41/ds4_store.hpp
++++ b/src/dsv41/ds4_store.hpp
+@@ -139,2 +139,39 @@
+         return (unsigned long long) ((uint8_t*) chunk_dev_[c] + (slots_[(size_t) slot].base - (uint8_t*) chunks_[c].first));
++    }
++
++    enum class Retain { stored, present, no_room, invalid };
++    /// Copy a completed flow read into a FREE slot, without I/O or eviction. The caller serializes this with
++    /// find()/metadata readers, as in the single-device flow worker; source spans stay valid until return.
++    /// Existing blobs (including unpinned ones borrowed by flow I/O) never move. Mapped arenas cannot grow here:
++    /// registering host memory while a GPU kernel runs can block; only their already committed slots may be used.
++    Retain retain_free(int layer, int e, const uint8_t* const parts[3], const size_t bytes[3]) {
++        std::lock_guard<std::mutex> lk(mu_);
++        if (layer < 0 || layer >= (int) geo_.size() || e < 0 || e >= geo_[(size_t) layer].n_exp ||
++            parts == nullptr || bytes == nullptr) return Retain::invalid;
++        const LayerGeo& g = geo_[(size_t) layer];
++        for (int r = 0; r < 3; ++r)
++            if (parts[r] == nullptr || bytes[r] == 0 || bytes[r] != g.bytes[r] ||
++                g.tr[r] > g.blob || bytes[r] > g.blob - g.tr[r]) return Retain::invalid;
++        if (where_[(size_t) layer][(size_t) e] >= 0) return Retain::present;   // includes an in-flight read
++        const uint64_t avail = cfg_.ram_avail ? cfg_.ram_avail() : ~uint64_t{0};
++        if (avail != ~uint64_t{0} && (avail < cfg_.floor_bytes || avail - cfg_.floor_bytes < slot_bytes_))
++            return Retain::no_room;   // committing a chunk need not have faulted its pages in yet
++        size_t s = 0;
++        while (s < nalloc_ && slots_[s].state.load(std::memory_order_acquire) != kFree) ++s;
++        if (s == nalloc_ && (cfg_.map_chunk || !grow())) return Retain::no_room;
++        Slot& sp = slots_[s];
++        for (int r = 0; r < 3; ++r) std::memcpy(sp.base + g.tr[r], parts[r], bytes[r]);
++        sp.layer = layer;
++        sp.expert = e;
++        sp.pin = 0;
++        sp.prefetch = sp.visible = false;
++        sp.left.store(0);
++        sp.bad.store(false);
++        sp.cancel.store(false);
++        sp.tick = ++clock_;
++        touch_heat(layer, e);
++        sp.state.store(kReady, std::memory_order_release);   // publish only complete, owned copies
++        where_[(size_t) layer][(size_t) e] = (int) s;
++        free_hint_ = std::max(free_hint_, s + 1);
++        return Retain::stored;
+     }
+diff --git a/src/dsv41/ds4_model.cu b/src/dsv41/ds4_model.cu
+--- a/src/dsv41/ds4_model.cu
++++ b/src/dsv41/ds4_model.cu
+@@ -572,2 +572,3 @@
+         uint8_t* keep = nullptr;                       // (layer-major) its layer-cache slot: what is read kept there
++        bool retain = false;                          // actual hot pick; copy to the RAM store before staging reuse
+         int64_t after = -1;                            // (layer-major) the items up to this one read first
+@@ -577,2 +578,5 @@
+     bool flow = false;
++    bool flow_store = false;   // DS4_FLOW_STORE=1: single-device, pageable store, no copy-mode; default off
++    uint64_t store_kept = 0, store_present = 0, store_full = 0, store_invalid = 0, store_early = 0, store_bytes = 0;
++    double store_copy_ms = 0;
+     int dev = -1;                            // the device (index into devs) this chunk state belongs to
+@@ -3305,2 +3309,11 @@
+         }
++        if (c.flow_store) {
++            for (size_t i = c.spec_begin; i < c.base + c.items.size(); ++i) {
++                Chunk::Item& it = fit(c, i);
++                if (b[(size_t) it.v + 1] <= b[(size_t) it.v] || l.heat[(size_t) it.e] < 4.0f) continue;
++                // Early speculative DMAs may already have released their source slot. Never reach back into it.
++                if (i < c.n_dma) ++c.store_early;
++                else it.retain = true;
++            }
++        }
+     }
+@@ -3445,2 +3458,16 @@
+             if (it.stage >= 0) CK(cudaEventRecord(c.stage_ev[(size_t) it.stage], c.cs));
++            if (it.retain) {
++                // All readers have finished and succeeded. The DMA only reads these same bytes; staging reuse
++                // cannot start until n_dma advances below AND stage_ev completes. No pointer escapes this copy.
++                const size_t bytes[3] = {mx_part_bytes(l, 0), mx_part_bytes(l, 1), mx_part_bytes(l, 2)};
++                const double ts = now_ms();
++                const auto kept = store->retain_free(it.il, it.e, it.src, bytes);
++                c.store_copy_ms += now_ms() - ts;
++                if (kept == ExpertStore::Retain::stored) {
++                    ++c.store_kept;
++                    c.store_bytes += bytes[0] + bytes[1] + bytes[2];
++                } else if (kept == ExpertStore::Retain::present) ++c.store_present;
++                else if (kept == ExpertStore::Retain::no_room) ++c.store_full;
++                else ++c.store_invalid;
++            }
+             c.stream_bytes += (double) unit(l);
+@@ -7364,2 +7391,12 @@
+             c.it_file = c.it_ram = c.it_spec = c.it_spec_unused = c.it_lc = 0;
++            const char* fs = std::getenv("DS4_FLOW_STORE");
++            const bool want_store = fs != nullptr && std::strcmp(fs, "1") == 0;
++            // This worker alone accesses the store's location table during flow. Cache mover threads use
++            // read_mx_file(), never store pointers; the main thread waits before decode/settle/shrink.
++            c.flow_store = want_store && devs.size() == 1 && store && !copy_mode && !store->gpu_mapped();
++            for (int il : c.fl_layers) c.flow_store = c.flow_store && L[(size_t) il].nm == 1;
++            c.store_kept = c.store_present = c.store_full = c.store_invalid = c.store_early = c.store_bytes = 0;
++            c.store_copy_ms = 0;
++            if (want_store && !c.flow_store)
++                std::fprintf(stderr, "ds4 flow store: inactive (requires single-device flow and a pageable RAM store, no copy-mode)\n");
+             c.lc_il = -1;
+@@ -8119,2 +8156,8 @@
+                              (unsigned long long) c.it_spec_unused, c.wait_ms);
++                if (c.flow_store)
++                    std::fprintf(stderr,
++                                 "ds4 flow store: retained=%llu bytes=%llu present=%llu no_room=%llu early=%llu invalid=%llu copy_ms=%.3f\n",
++                                 (unsigned long long) c.store_kept, (unsigned long long) c.store_bytes,
++                                 (unsigned long long) c.store_present, (unsigned long long) c.store_full,
++                                 (unsigned long long) c.store_early, (unsigned long long) c.store_invalid, c.store_copy_ms);
+             }

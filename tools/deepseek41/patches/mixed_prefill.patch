@@ -1,0 +1,71 @@
+diff --git a/src/dsv41/ds4_model.cu b/src/dsv41/ds4_model.cu
+--- a/src/dsv41/ds4_model.cu
++++ b/src/dsv41/ds4_model.cu
+@@ -23,2 +23,3 @@
+ #include "ds4_pool.hpp"
++#include "ds4_prefill_schedule.hpp"
+ #include "ds4_store.hpp"
+@@ -876,2 +877,6 @@
+     } pm;
++    MixedPrefillSchedule mixed_prefill{[] {
++        const char* v = std::getenv("DS4_MIXED_PREFILL");
++        return v != nullptr && std::strcmp(v, "1") == 0;
++    }()};   // default off; first successful eligible feed uses flow, later feeds use windows
+     static constexpr int kPickMax = 2048;   // (from here on the flow: windows' work grows with every 16 tokens)
+@@ -7749,2 +7754,8 @@
+         pm.last = -1;
++        const int forced = mixed_prefill.pick();
++        if (forced >= 0) {
++            if (o.verbose)
++                std::fprintf(stderr, "ds4 mixed prefill: path=%s tokens=%d\n", forced ? "flow" : "windows", n);
++            return forced != 0;   // existing caller owns both paths, checkpoints and cancellation
++        }
+         if (!pm.on || n >= kPickMax) return true;
+@@ -7822,2 +7833,3 @@
+     void path_done(double ms) {
++        mixed_prefill.complete();
+         if (pm.last < 0 || pm.last_pred <= 0) return;
+@@ -9114,2 +9126,3 @@
+     Impl& p = *p_;
++    p.mixed_prefill.begin_feed();
+     p.pm.last = -1;
+@@ -9127,2 +9140,3 @@
+     Impl& p = *p_;
++    p.mixed_prefill.begin_feed();
+     p.pm.last = -1;
+diff --git a/src/dsv41/ds4_prefill_schedule.hpp b/src/dsv41/ds4_prefill_schedule.hpp
+new file mode 100644
+--- /dev/null
++++ b/src/dsv41/ds4_prefill_schedule.hpp
+@@ -0,0 +1,31 @@
++// Experimental per-model prefill schedule; no tensors, kernels or cache ownership.
++#pragma once
++
++namespace strata::ds4 {
++class MixedPrefillSchedule {
++public:
++    explicit MixedPrefillSchedule(bool enabled = false) : enabled_(enabled) {}
++
++    // Every feed starts here, including feeds that bypass path selection. A failed or cancelled
++    // previous feed cannot later be counted as successful by an unrelated single-token feed.
++    void begin_feed() { pending_ = false; }
++
++    // -1 keeps the native automatic selector. Only eligible feeds call pick().
++    int pick() {
++        if (!enabled_) return -1;
++        pending_ = true;
++        return used_flow_ ? 0 : 1;
++    }
++
++    // Called only after a successful feed. KV reset intentionally does not reset this model-lifetime state.
++    void complete() {
++        if (pending_) used_flow_ = true;
++        pending_ = false;
++    }
++
++private:
++    const bool enabled_;
++    bool used_flow_ = false;
++    bool pending_ = false;
++};
++}  // namespace strata::ds4

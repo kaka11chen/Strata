@@ -258,6 +258,12 @@ add_library(strata_artifact INTERFACE)
 target_include_directories(strata_artifact INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(strata_artifact INTERFACE strata_warnings)
 
+# Native DeepSeek artifact bring-up; does not change the Qwen execution path.
+option(STRATA_ENABLE_DEEPSEEK41 "Build experimental DeepSeek-V4.1-1017 artifact tools and native components" OFF)
+if(STRATA_ENABLE_DEEPSEEK41)
+  add_subdirectory(src/deepseek41)
+endif()
+
 add_executable(strata-gguf src/artifact/gguf_reader.cpp)
 target_link_libraries(strata-gguf PRIVATE strata_artifact)
 

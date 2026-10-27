@@ -1,0 +1,41 @@
+diff --git a/src/dsv41/ds4_main.cpp b/src/dsv41/ds4_main.cpp
+--- a/src/dsv41/ds4_main.cpp
++++ b/src/dsv41/ds4_main.cpp
+@@ -20,2 +20,3 @@
+ // reading it again (also without slots).  STRATA_DS4_REUSE=0 turns every reuse off (each request reads its whole prompt).
++// DS4_STORE_STATS=1 adds two STORE lines before DONE: prefill/decode deltas of existing RAM-store counters.
+ #include "ds4_model.hpp"
+@@ -317,3 +318,20 @@
+
++// Opt-in observations only: deltas of the engine's existing counters. Store bytes count submitted
++// expert payloads (demand and prefetch), not physical disk traffic. cpu_ms includes store wait.
++void print_store_stats(const char* phase, const strata::ds4::Stats& before, const strata::ds4::Stats& after) {
++    std::printf("STORE phase=%s tokens=%lld hits=%lld misses=%lld submitted_bytes=%lld wait_ms=%.3f cpu_lane_ms=%.3f "
++                "evictions=%lld read_fails=%lld prefetched=%lld prefetch_used=%lld prefetch_wasted=%lld "
++                "slots=%lld slots_max=%lld\n",
++                phase, (long long) (after.tokens - before.tokens),
++                (long long) (after.store_hits - before.store_hits), (long long) (after.store_misses - before.store_misses),
++                (long long) (after.store_bytes - before.store_bytes), after.store_wait_ms - before.store_wait_ms,
++                after.cpu_ms - before.cpu_ms, (long long) (after.store_evictions - before.store_evictions),
++                (long long) (after.store_fails - before.store_fails), (long long) (after.store_prefetched - before.store_prefetched),
++                (long long) (after.store_pf_used - before.store_pf_used), (long long) (after.store_pf_wasted - before.store_pf_wasted),
++                (long long) after.store_slots, (long long) after.store_slots_max);
++}
++
+ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float conf_min, const std::string& pack) {
++    const char* store_env = std::getenv("DS4_STORE_STATS");
++    const bool store_stats = store_env != nullptr && std::strcmp(store_env, "1") == 0;
+     std::vector<int> eos = parse_ids(eos_list);
+@@ -766,2 +784,4 @@
+         size_t done = from, next_pp = from + 64;
++        strata::ds4::Stats s_prefill;
++        if (store_stats) s_prefill = m.stats();   // Copy: Model::stats updates a shared object.
+         m.set_progress([&](int64_t d) {   // (a run of chunks: each one through every layer)
+@@ -916,2 +936,7 @@
+         const double t2 = now_ms();
++        if (store_stats) {
++            const strata::ds4::Stats s_end = m.stats();
++            print_store_stats("prefill", s_prefill, s_dec);
++            print_store_stats("decode", s_dec, s_end);
++        }
+         std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0\n", produced, r.ids.size(), t1 - t0, t2 - t1, finish,

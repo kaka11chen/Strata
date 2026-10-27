@@ -1,0 +1,61 @@
+diff --git a/src/dsv41/ds4_model.cu b/src/dsv41/ds4_model.cu
+--- a/src/dsv41/ds4_model.cu
++++ b/src/dsv41/ds4_model.cu
+@@ -881,2 +881,6 @@
+     }()};   // default off; first successful eligible feed uses flow, later feeds use windows
++    FirstWindowPrefill first_window{[] {
++        const char* v = std::getenv("DS4_FIRST_WINDOW");
++        return v != nullptr && std::strcmp(v, "1") == 0;
++    }()};   // default off; one successful eligible feed per model, with the native window limit
+     static constexpr int kPickMax = 2048;   // (from here on the flow: windows' work grows with every 16 tokens)
+@@ -7760,2 +7764,7 @@
+         }
++        if (first_window.pick(n, kWin)) {
++            if (o.verbose)
++                std::fprintf(stderr, "ds4 first window: tokens=%d limit=%d\n", n, kWin);
++            return false;   // preserve existing windows, checkpoint and cancellation behavior
++        }
+         if (!pm.on || n >= kPickMax) return true;
+@@ -7834,2 +7843,3 @@
+         mixed_prefill.complete();
++        first_window.complete();
+         if (pm.last < 0 || pm.last_pred <= 0) return;
+@@ -9127,2 +9137,3 @@
+     p.mixed_prefill.begin_feed();
++    p.first_window.begin_feed();
+     p.pm.last = -1;
+@@ -9141,2 +9152,3 @@
+     p.mixed_prefill.begin_feed();
++    p.first_window.begin_feed();
+     p.pm.last = -1;
+diff --git a/src/dsv41/ds4_prefill_schedule.hpp b/src/dsv41/ds4_prefill_schedule.hpp
+--- a/src/dsv41/ds4_prefill_schedule.hpp
++++ b/src/dsv41/ds4_prefill_schedule.hpp
+@@ -30,2 +30,27 @@
+ };
++// Independent default-off first-feed guard. Larger first feeds also consume the opportunity on success.
++class FirstWindowPrefill {
++public:
++    explicit FirstWindowPrefill(bool enabled = false) : enabled_(enabled) {}
++
++    void begin_feed() { pending_ = false; }
++
++    // Only eligible feeds call this. False delegates to the original automatic picker.
++    bool pick(int tokens, int window) {
++        if (!enabled_) return false;
++        pending_ = true;
++        return !completed_ && tokens <= window;
++    }
++
++    // Failed/cancelled feeds do not call this. Bypasses never create a pending selection.
++    void complete() {
++        if (pending_) completed_ = true;
++        pending_ = false;
++    }
++
++private:
++    const bool enabled_;
++    bool completed_ = false;
++    bool pending_ = false;
++};
+ }  // namespace strata::ds4

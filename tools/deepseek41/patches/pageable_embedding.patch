@@ -1,0 +1,25 @@
+diff --git a/src/dsv41/ds4_model.cu b/src/dsv41/ds4_model.cu
+--- a/src/dsv41/ds4_model.cu
++++ b/src/dsv41/ds4_model.cu
+@@ -920,2 +920,3 @@
+     uint16_t* embed_pinned = nullptr;
++    std::vector<uint16_t> embed_pageable;   // optional CPU table; transfers use the existing pinned row staging
+     std::vector<float> freqs_win, freqs_comp;
+@@ -2411,3 +2412,16 @@
+             }
+-            if (!halloc(embed_pinned, nv, err)) return false;
++            // The table itself is only read by CPU memcpy into h_emb / emb_host.
++            // Some driver/OS combinations reject a single large pinned region.
++            const char* pageable = std::getenv("DS4_PAGEABLE_EMBED");
++            if (pageable != nullptr && std::atoi(pageable) != 0) {
++                try {
++                    embed_pageable.resize(nv);
++                } catch (const std::bad_alloc&) {
++                    err = "embed.weight: allocating pageable host table failed";
++                    return false;
++                }
++                embed_pinned = embed_pageable.data();
++                std::fprintf(stderr, "ds4: embedding table in pageable RAM (%.2f GB); pinned row staging retained\n",
++                             (double) (nv * 2) / 1e9);
++            } else if (!halloc(embed_pinned, nv, err)) return false;
+             if (qrow) {   // (ggml's decode of each row, rounded to BF16 as the Q8_0 path rounds)

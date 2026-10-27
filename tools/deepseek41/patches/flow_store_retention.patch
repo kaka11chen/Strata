@@ -1,0 +1,29 @@
+diff --git a/src/dsv41/ds4_model.cu b/src/dsv41/ds4_model.cu
+--- a/src/dsv41/ds4_model.cu
++++ b/src/dsv41/ds4_model.cu
+@@ -885,2 +885,3 @@
+     }()};   // default off; one successful eligible feed per model, with the native window limit
++    const float flow_store_heat = flow_store_min_heat(std::getenv("DS4_FLOW_STORE_MIN_HEAT"));
+     static constexpr int kPickMax = 2048;   // (from here on the flow: windows' work grows with every 16 tokens)
+@@ -3321,3 +3322,3 @@
+                 Chunk::Item& it = fit(c, i);
+-                if (b[(size_t) it.v + 1] <= b[(size_t) it.v] || l.heat[(size_t) it.e] < 4.0f) continue;
++                if (b[(size_t) it.v + 1] <= b[(size_t) it.v] || l.heat[(size_t) it.e] < flow_store_heat) continue;
+                 // Early speculative DMAs may already have released their source slot. Never reach back into it.
+@@ -7408,2 +7409,4 @@
+             c.store_copy_ms = 0;
++            if (c.flow_store && o.verbose && flow_store_heat != 4.0f)
++                std::fprintf(stderr, "ds4 flow store: experimental min_heat=%.0f\n", flow_store_heat);
+             if (want_store && !c.flow_store)
+diff --git a/src/dsv41/ds4_prefill_schedule.hpp b/src/dsv41/ds4_prefill_schedule.hpp
+--- a/src/dsv41/ds4_prefill_schedule.hpp
++++ b/src/dsv41/ds4_prefill_schedule.hpp
+@@ -4,2 +4,8 @@
+ namespace strata::ds4 {
++// Only the exact experimental value 1 lowers flow retention heat; all other settings keep 4.
++// This is admission into free slots, independent of the post-prompt preload threshold.
++constexpr float flow_store_min_heat(const char* setting = nullptr) {
++    return setting != nullptr && setting[0] == '1' && setting[1] == '\0' ? 1.0f : 4.0f;
++}
++
+ class MixedPrefillSchedule {
